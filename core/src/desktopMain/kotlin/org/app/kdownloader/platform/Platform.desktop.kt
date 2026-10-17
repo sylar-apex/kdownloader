@@ -21,7 +21,8 @@ actual fun defaultNetworkMonitor(): NetworkMonitor = NetworkMonitor { true }
 actual fun defaultStorage(): DownloadStorage = DesktopDownloadStorage()
 
 /**
- * Parts in the temp folder; finished files in ~/Movies, ~/Music or ~/Downloads under the app folder;
+ * Parts in the temp folder; finished files in ~/Movies, ~/Music or ~/Downloads under the app folder
+ * (or straight into the app folder when it is an absolute path);
  * hidden files in [privateDir].
  */
 class DesktopDownloadStorage(
@@ -44,6 +45,8 @@ class DesktopDownloadStorage(
     override fun locationOf(destination: Destination, appFolder: String): String = folder(destination, appFolder).path + File.separator
 
     private fun folder(destination: Destination, appFolder: String): File {
+        // A folder the user picked is used as is.
+        File(appFolder).takeIf { it.isAbsolute }?.let { return it }
         val root = when {
             destination.folder == Folder.DOWNLOADS || destination.type == MediaType.OTHER -> "Downloads"
             destination.type == MediaType.AUDIO -> "Music"
