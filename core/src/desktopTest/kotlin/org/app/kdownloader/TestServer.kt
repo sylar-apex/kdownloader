@@ -4,13 +4,18 @@ import com.sun.net.httpserver.HttpServer
 import java.net.InetSocketAddress
 import java.util.Collections
 
-/** A local http server with Range support. `/slow/...` sends in small, delayed chunks. */
+/**
+ * A local http server with Range support. `/slow/...` sends in small, delayed chunks. `/expired/...`
+ * always answers 403, `/cookiewall/...` answers 403 when a Cookie header is sent, `/seg/<i>` serves
+ * quarter i of the body, and paths in [texts] serve that text (playlists).
+ */
 class TestServer(private val body: ByteArray) : AutoCloseable {
     private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
     val ranges: MutableList<String> = Collections.synchronizedList(mutableListOf())
     val requestedPaths: MutableList<String> = Collections.synchronizedList(mutableListOf())
     val customHeaders: MutableList<String> = Collections.synchronizedList(mutableListOf())
     private val flakyHits = java.util.concurrent.atomic.AtomicInteger()
+    val texts: MutableMap<String, String> = java.util.concurrent.ConcurrentHashMap()
 
     init {
         server.createContext("/") { exchange ->
@@ -22,7 +27,29 @@ class TestServer(private val body: ByteArray) : AutoCloseable {
                 exchange.close()
                 return@createContext
             }
-            if (path.startsWith("/missing")) {
+            texts[path]?.let { text ->
+                val bytes = text.encodeToByteArray()
+                exchange.sendResponseHeaders(200, bytes.size.toLong())
+                exchange.responseBody.use { it.write(bytes) }
+                exchange.close()
+                return@createContext
+            }
+            if (path.startsWith("/seg/")) {
+                val i = path.removePrefix("/seg/").substringBefore('.').toInt()
+                val quarter = body.size / 4
+                val slice = body.copyOfRange(i * quarter, if (i == 3) body.size else (i + 1) * quarter)
+                exchange.sendResponseHeaders(200, slice.size.toLong())
+                exchange.responseBody.use { it.write(slice) }
+                exchange.close()
+                return@createContext
+            }
+            val cookieWall = path.startsWith("/cookiewall") && exchange.requestHeaders.getFirst("Cookie") != null
+            if (path.startsWith("/missing") || path.startsWith("/expired") || cookieWall) {
+                if (path.startsWith("/expired") || cookieWall) {
+                    exchange.sendResponseHeaders(403, -1)
+                    exchange.close()
+                    return@createContext
+                }
                 exchange.sendResponseHeaders(404, -1)
                 exchange.close()
                 return@createContext

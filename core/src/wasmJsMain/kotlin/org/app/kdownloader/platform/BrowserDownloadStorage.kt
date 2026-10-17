@@ -58,6 +58,13 @@ class BrowserDownloadStorage : DownloadStorage {
         }
     }
 
+    override suspend fun appendPart(fromTaskId: String, fromPart: Int, toTaskId: String, toPart: Int) {
+        val source = parts[fromTaskId]?.remove(fromPart) ?: return
+        val target = parts.getOrPut(toTaskId) { mutableMapOf() }.getOrPut(toPart) { Part() }
+        pushAll(target.chunks, source.chunks)
+        target.size += source.size
+    }
+
     /** The browser names the saved file itself and renames on conflicts. */
     override suspend fun publish(task: DownloadTask, appFolder: String, conflict: ConflictPolicy): Published {
         val part = parts[task.id]?.get(0) ?: error("Nothing was downloaded")

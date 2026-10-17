@@ -18,7 +18,7 @@ internal object QueuePlanner {
     )
 
     fun plan(tasks: List<DownloadTask>, config: DownloaderConfig, unmetered: Boolean, now: Long): Plan {
-        var running = tasks.count { it.status == DownloadStatus.RUNNING }
+        var running = tasks.count { it.status.isWorking }
         val queued = tasks.filter { it.status == DownloadStatus.QUEUED }.sortedWith(queueOrder)
         val start = mutableListOf<DownloadTask>()
         var waiting = false

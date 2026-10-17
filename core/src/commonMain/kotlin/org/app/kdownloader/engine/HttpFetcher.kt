@@ -5,12 +5,16 @@ import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.head
 import io.ktor.client.request.header
 import io.ktor.client.request.prepareGet
+import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsChannel
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentLength
 import io.ktor.http.isSuccess
+import io.ktor.utils.io.discard
 import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import org.app.kdownloader.platform.PartWriter
@@ -78,6 +82,99 @@ internal class HttpFetcher(private val client: HttpClient, private val userAgent
             total
         }
     }
+
+    /** Size from a `Range: bytes=0-0` GET (the authoritative `Content-Range` total), or -1. */
+    suspend fun probeRange(url: String, headers: Map<String, String>): Long = runCatching {
+        client.prepareGet(url) {
+            applyHeaders(headers)
+            header(HttpHeaders.Range, "bytes=0-0")
+        }.execute { response ->
+            if (!response.status.isSuccess()) return@execute -1L
+            totalFromContentRange(response.headers[HttpHeaders.ContentRange]) ?: response.contentLength() ?: -1L
+        }
+    }.getOrDefault(-1L)
+
+    /** The body of [url] as text (playlists). */
+    suspend fun getText(url: String, headers: Map<String, String>): String =
+        client.prepareGet(url) { applyHeaders(headers) }.execute { response ->
+            if (!response.status.isSuccess()) throw DownloadException("HTTP ${response.status.value}", response.status.value)
+            response.bodyAsText()
+        }
+
+    /**
+     * Writes bytes [start]..[end] of [url] into [writer]. Servers often close early, so it keeps
+     * re-requesting from where it stopped; three requests in a row without progress fail with "Short read".
+     * A 200 that ignores the range is skipped ahead to the offset.
+     */
+    suspend fun fetchRange(
+        url: String,
+        headers: Map<String, String>,
+        start: Long,
+        end: Long,
+        writer: PartWriter,
+        allowHtml: Boolean,
+        onBytes: suspend (Int) -> Unit,
+    ) {
+        var pos = start
+        var stalls = 0
+        while (pos <= end) {
+            val before = pos
+            client.prepareGet(url) {
+                applyHeaders(headers)
+                header(HttpHeaders.Range, "bytes=$pos-$end")
+            }.execute { response ->
+                val code = response.status.value
+                if (code != 206 && code != 200) throw DownloadException("HTTP $code", code)
+                if (!allowHtml && response.isHtml()) throw DownloadException("Server returned a web page, not media", transient = true)
+                val channel = response.bodyAsChannel()
+                if (code == 200 && pos > 0) channel.discard(pos)
+                val buffer = ByteArray(BUFFER_SIZE)
+                try {
+                    while (pos <= end) {
+                        currentCoroutineContext().ensureActive()
+                        val read = channel.readAvailable(buffer, 0, minOf(buffer.size.toLong(), end - pos + 1).toInt())
+                        if (read < 0) break
+                        if (read == 0) {
+                            if (channel.isClosedForRead) break
+                            continue
+                        }
+                        writer.write(buffer, 0, read)
+                        pos += read
+                        onBytes(read)
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    if (pos == before) throw error
+                }
+            }
+            if (pos == before && ++stalls >= 3) throw DownloadException("Short read", transient = true)
+        }
+    }
+
+    /** Writes the whole body of [url] into [writer]. */
+    suspend fun fetchWhole(url: String, headers: Map<String, String>, writer: PartWriter, allowHtml: Boolean, onBytes: suspend (Int) -> Unit) {
+        client.prepareGet(url) { applyHeaders(headers) }.execute { response ->
+            val code = response.status.value
+            if (!response.status.isSuccess()) throw DownloadException("HTTP $code", code)
+            if (!allowHtml && response.isHtml()) throw DownloadException("Server returned a web page, not media", transient = true)
+            val channel = response.bodyAsChannel()
+            val buffer = ByteArray(BUFFER_SIZE)
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val read = channel.readAvailable(buffer, 0, buffer.size)
+                if (read < 0) break
+                if (read == 0) {
+                    if (channel.isClosedForRead) break
+                    continue
+                }
+                writer.write(buffer, 0, read)
+                onBytes(read)
+            }
+        }
+    }
+
+    private fun HttpResponse.isHtml() = headers[HttpHeaders.ContentType].orEmpty().startsWith("text/html")
 
     /** The user agent first, so a request header can replace it. */
     private fun HttpRequestBuilder.applyHeaders(headers: Map<String, String>) {

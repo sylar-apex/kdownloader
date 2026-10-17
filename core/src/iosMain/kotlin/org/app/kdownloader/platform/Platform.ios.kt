@@ -11,6 +11,7 @@ import org.app.kdownloader.model.Destination
 import org.app.kdownloader.model.DownloadTask
 import org.app.kdownloader.model.Folder
 import org.app.kdownloader.model.MediaType
+import platform.Foundation.NSApplicationSupportDirectory
 import platform.Foundation.NSDocumentDirectory
 import platform.Foundation.NSSearchPathForDirectoriesInDomains
 import platform.Foundation.NSTemporaryDirectory
@@ -18,14 +19,17 @@ import platform.Foundation.NSUserDomainMask
 
 internal actual fun defaultHttpClient(): HttpClient = HttpClient(Darwin)
 
+private fun applicationSupport(): String =
+    (NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, true).firstOrNull() as? String).orEmpty()
+
 internal actual val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 
 actual fun defaultNetworkMonitor(): NetworkMonitor = NetworkMonitor { true }
 
 actual fun defaultStorage(): DownloadStorage = IosDownloadStorage()
 
-/** Parts in the temp folder; finished files under Documents, visible in the Files app. */
-class IosDownloadStorage : FileDownloadStorage(Path(NSTemporaryDirectory(), "kdownloader")) {
+/** Parts in the temp folder; finished files under Documents, visible in the Files app; hidden files in Application Support. */
+class IosDownloadStorage : FileDownloadStorage(Path(NSTemporaryDirectory(), "kdownloader"), Path(applicationSupport(), "kdownloader/private")) {
     private val documents: String =
         (NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, true).firstOrNull() as? String).orEmpty()
 

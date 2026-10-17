@@ -12,6 +12,8 @@ package org.app.kdownloader.model
  * - [autoResume]: restart interrupted downloads on the next launch; otherwise they come back paused.
  * - [networkRecheckMs]: how often a Wi-Fi-only queue checks whether Wi-Fi is back.
  * - [appFolder]: sub-folder inside Movies, Music or Download.
+ * - [segmentBytes]: segment size of multi-part downloads ([DownloadRequest.parts]); each part is fetched
+ *   in fixed segments over [connections] (at most 8) workers and resumes segment by segment.
  */
 data class DownloaderConfig(
     val maxParallel: Int = 2,
@@ -26,6 +28,7 @@ data class DownloaderConfig(
     val networkRecheckMs: Long = 5_000,
     val appFolder: String = "KDownloader",
     val userAgent: String = "KDownloader/1.0",
+    val segmentBytes: Long = 4L * 1024 * 1024,
 ) {
     val parallel: Int get() = maxParallel.coerceIn(1, MAX_PARALLEL)
 

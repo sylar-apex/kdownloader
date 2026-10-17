@@ -53,6 +53,7 @@ kotlin {
         }
         androidMain.dependencies {
             implementation(libs.ktor.client.cio)
+            implementation(libs.androidx.core.ktx)
         }
         desktopMain.dependencies {
             implementation(libs.ktor.client.cio)

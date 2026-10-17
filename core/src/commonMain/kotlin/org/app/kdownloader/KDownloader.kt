@@ -20,6 +20,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.app.kdownloader.engine.DownloadRunner
 import org.app.kdownloader.engine.HttpFetcher
+import org.app.kdownloader.engine.PartKeys
+import org.app.kdownloader.engine.PartRunner
+import org.app.kdownloader.engine.ProgressSink
+import org.app.kdownloader.engine.TaskHandle
 import org.app.kdownloader.engine.QueuePlanner
 import org.app.kdownloader.engine.RateLimiter
 import org.app.kdownloader.engine.RunOptions
@@ -32,6 +36,13 @@ import org.app.kdownloader.model.DownloadStatus
 import org.app.kdownloader.model.DownloadTask
 import org.app.kdownloader.model.DownloaderConfig
 import org.app.kdownloader.model.EnqueueResult
+import org.app.kdownloader.model.MediaType
+import org.app.kdownloader.model.TaskExtras
+import org.app.kdownloader.model.title
+import org.app.kdownloader.merge.AudioExtractor
+import org.app.kdownloader.merge.Merger
+import org.app.kdownloader.merge.defaultAudioExtractor
+import org.app.kdownloader.merge.defaultMerger
 import org.app.kdownloader.platform.DownloadStorage
 import org.app.kdownloader.platform.NetworkMonitor
 import org.app.kdownloader.platform.defaultHttpClient
@@ -54,6 +65,10 @@ import kotlin.time.ExperimentalTime
  * ```
  *
  * Pass your own [httpClient] to share an app-wide Ktor client (proxy, logging, certificates).
+ *
+ * Multi-part downloads ([DownloadRequest.parts]: separate video and audio streams, HLS playlists) are
+ * joined by [merger] while the task is [DownloadStatus.MERGING]. [urlRefresher] supplies fresh urls when
+ * signed links expire. [audioExtractor] powers [convertToMusic] (Android only by default).
  */
 @OptIn(ExperimentalTime::class)
 class KDownloader(
@@ -63,12 +78,21 @@ class KDownloader(
     private val network: NetworkMonitor = defaultNetworkMonitor(),
     httpClient: HttpClient = defaultHttpClient(),
     private val clock: () -> Long = { Clock.System.now().toEpochMilliseconds() },
+    private val merger: Merger = defaultMerger(),
+    /** Asked for fresh urls of multi-part tasks; may be set after construction. */
+    var urlRefresher: UrlRefresher? = null,
+    private val audioExtractor: AudioExtractor? = defaultAudioExtractor(),
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /** Every task mutation runs here, one at a time. */
     private val serial = Dispatchers.Default.limitedParallelism(1)
-    private val runner = DownloadRunner(HttpFetcher(httpClient, config.userAgent), storage)
+    private val fetcher = HttpFetcher(httpClient, config.userAgent)
+    private val runner = DownloadRunner(fetcher, storage)
+    private val partRunner = PartRunner(fetcher, storage)
+
+    /** Tasks the user resumed: their signed urls may have expired, so they are refreshed before restarting. */
+    private val refreshOnStart = mutableSetOf<String>()
     private val jobs = mutableMapOf<String, Job>()
     private val taskLimiters = mutableMapOf<String, RateLimiter>()
     private var counter = 0
@@ -114,12 +138,13 @@ class KDownloader(
         val now = clock()
         var result: EnqueueResult? = null
         _tasks.update { list ->
-            val existing = list.firstOrNull { it.url == request.url && it.status.isActive }
+            val url = request.url.ifBlank { request.parts.firstOrNull()?.url.orEmpty() }
+            val existing = list.firstOrNull { it.url == url && it.status.isActive }
             if (existing != null) {
                 result = EnqueueResult.Duplicate(existing)
                 list
             } else {
-                val task = request.toTask("dl-$now-${counter++}", now, order = nextOrder(list))
+                val task = request.toTask("dl-$now-${counter++}", url, now, order = nextOrder(list))
                 result = EnqueueResult.Added(task)
                 list + task
             }
@@ -138,6 +163,7 @@ class KDownloader(
 
     /** Queues a paused or failed task again, resetting its retry count. */
     fun resume(id: String) = serially {
+        if (find(id)?.status?.isResumable == true) refreshOnStart += id
         edit(id) { if (status.isResumable) copy(status = DownloadStatus.QUEUED, error = null, attempts = 0) else this }
         persist()
         pump()
@@ -150,7 +176,7 @@ class KDownloader(
         val task = find(id) ?: return@serially
         if (task.status == DownloadStatus.COMPLETED || task.status == DownloadStatus.CANCELED) return@serially
         stopJob(id)
-        storage.deleteParts(id)
+        deleteAllParts(task)
         edit(id) { copy(status = DownloadStatus.CANCELED, speedBytesPerSec = 0) }
         persist()
         pump()
@@ -163,11 +189,126 @@ class KDownloader(
     fun remove(ids: Collection<String>) = serially {
         tasks.value.filter { it.id in ids && it.status.isActive }.forEach {
             stopJob(it.id)
-            storage.deleteParts(it.id)
+            deleteAllParts(it)
         }
         _tasks.update { list -> list.filter { it.id !in ids } }
         persist()
         pump()
+    }
+
+    /** Stops and removes [id]; with [withFile] its saved file is deleted too. */
+    fun delete(id: String, withFile: Boolean = true) = serially {
+        val task = find(id) ?: return@serially
+        stopJob(id)
+        deleteAllParts(task)
+        if (withFile) task.localUri?.let { storage.deleteFile(it) }
+        _tasks.update { list -> list.filter { it.id != id } }
+        persist()
+        pump()
+    }
+
+    // ---- Editing ----
+
+    /** Applies [transform] to task [id] and saves it, e.g. to fill in a thumbnail or duration later. */
+    fun update(id: String, transform: (DownloadTask) -> DownloadTask) = serially {
+        edit(id) { transform(this) }
+        persist()
+    }
+
+    /** Adds or replaces [extras] of task [id]. */
+    fun putExtras(id: String, extras: Map<String, String>) = update(id) { it.copy(extras = it.extras + extras) }
+
+    /**
+     * Renames task [id] to [newName] plus its current extension. A saved file is renamed too where the
+     * storage can (files, MediaStore); the [TaskExtras.TITLE] extra follows when present.
+     */
+    fun rename(id: String, newName: String) = serially {
+        val task = find(id) ?: return@serially
+        val ext = task.fileName.substringAfterLast('.', "")
+        val newFileName = if (ext.isEmpty()) newName else "$newName.$ext"
+        val uri = task.localUri?.takeIf { task.status == DownloadStatus.COMPLETED }?.let { storage.renameFile(it, newFileName) } ?: task.localUri
+        edit(id) {
+            copy(fileName = newFileName, localUri = uri, extras = if (TaskExtras.TITLE in extras) extras + (TaskExtras.TITLE to newName) else extras)
+        }
+        persist()
+    }
+
+    /**
+     * Private folder: moves a finished file out of shared storage (galleries cannot see it) into app
+     * storage, and back. Where the storage cannot move files (web) only [DownloadTask.hidden] changes.
+     */
+    fun setHidden(id: String, hidden: Boolean): Job = scope.launch(ioDispatcher) {
+        val task = find(id) ?: return@launch
+        if (task.status != DownloadStatus.COMPLETED || task.hidden == hidden) return@launch
+        val cfg = config.value
+        val uri = try {
+            if (hidden) storage.hide(task) else storage.unhide(task, cfg.appFolder, cfg.conflict)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            return@launch
+        }
+        withContext(serial) {
+            edit(id) { copy(hidden = hidden, localUri = uri ?: localUri) }
+            persist()
+        }
+    }
+
+    /**
+     * "Convert to music": copies the audio track of finished task [id] into a new M4A (no re-encode) and
+     * adds it as a new completed task saved as audio. [fileName] defaults to the title + ".m4a"; [extras]
+     * to the source's extras without [TaskExtras.QUALITY]. Returns null when it failed or the platform has
+     * no [AudioExtractor] (only Android has one by default).
+     */
+    suspend fun convertToMusic(id: String, fileName: String? = null, extras: Map<String, String>? = null): DownloadTask? = withContext(ioDispatcher) {
+        val extractor = audioExtractor ?: return@withContext null
+        val source = find(id) ?: return@withContext null
+        val uri = source.localUri ?: return@withContext null
+        val now = clock()
+        val newId = withContext(serial) { "dl-$now-${counter++}" }
+        val work = "$newId.src"
+        try {
+            if (!storage.importPart(uri, work, 0)) return@withContext null
+            val input = storage.localPartPath(work, 0) ?: return@withContext null
+            val output = storage.localPartPath(newId, 0) ?: return@withContext null
+            extractor.extractAudio(input, output)
+            storage.deleteParts(work)
+            val size = storage.partSize(newId, 0)
+            val name = fileName ?: (source.title.replace(UNSAFE_NAME, "_").take(120) + ".m4a")
+            val music = source.copy(
+                id = newId,
+                url = "$uri#audio",
+                fileName = name,
+                destination = Destination(MediaType.AUDIO, source.destination.folder),
+                status = DownloadStatus.COMPLETED,
+                downloadedBytes = size,
+                totalBytes = size,
+                error = null,
+                localUri = null,
+                createdAt = now,
+                extras = extras ?: (source.extras - TaskExtras.QUALITY + (TaskExtras.EXT to "m4a")),
+                segments = 1,
+                attempts = 0,
+                parts = emptyList(),
+                hidden = false,
+                finishedAt = now,
+            )
+            val cfg = config.value
+            val published = storage.publish(music, cfg.appFolder, cfg.conflict)
+            storage.deleteParts(newId)
+            val done = music.copy(localUri = published.uri)
+            withContext(serial) {
+                _tasks.update { list -> list + done.copy(order = nextOrder(list)) }
+                persist()
+            }
+            done
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            storage.deleteParts(work)
+            storage.deleteParts(newId)
+            null
+        }
     }
 
     // ---- Queue order ----
@@ -236,6 +377,7 @@ class KDownloader(
     private fun resumeWhere(predicate: (DownloadTask) -> Boolean): Int {
         val paused = tasks.value.filter { it.status.isResumable && predicate(it) }
         serially {
+            paused.forEach { task -> refreshOnStart += task.id }
             paused.forEach { task -> edit(task.id) { copy(status = DownloadStatus.QUEUED, error = null, attempts = 0) } }
             persist()
             pump()
@@ -258,6 +400,11 @@ class KDownloader(
         if (status != DownloadStatus.RUNNING && status != DownloadStatus.QUEUED) return
         stopJob(id)
         edit(id) { copy(status = DownloadStatus.PAUSED, speedBytesPerSec = 0) }
+    }
+
+    private suspend fun deleteAllParts(task: DownloadTask) {
+        storage.deleteParts(task.id)
+        PartKeys.all(task).forEach { storage.deleteParts(it) }
     }
 
     private fun stopJob(id: String) {
@@ -286,6 +433,7 @@ class KDownloader(
     private fun start(task: DownloadTask) {
         edit(task.id) { copy(status = DownloadStatus.RUNNING, error = null) }
         persist()
+        val refreshFirst = refreshOnStart.remove(task.id) && task.parts.isNotEmpty()
         _events.tryEmit(DownloadEvent.Started(task))
         val cfg = config.value
         val limiter = RateLimiter(clock) { find(task.id)?.speedLimitBytesPerSec ?: 0 }
@@ -294,14 +442,15 @@ class KDownloader(
             connections = task.connections ?: cfg.connections,
             minSegmentBytes = cfg.minSegmentBytes,
             limiters = listOf(globalLimiter, limiter),
+            segmentBytes = cfg.segmentBytes,
         )
         jobs[task.id] = scope.launch(ioDispatcher) {
             try {
                 var lastUpdate = 0L
                 val meter = SpeedMeter()
-                runner.run(task, options) { downloaded, total, segments ->
+                val progress = ProgressSink { downloaded, total, segments ->
                     val now = clock()
-                    if (now - lastUpdate < cfg.progressIntervalMs && (total <= 0 || downloaded < total)) return@run
+                    if (now - lastUpdate < cfg.progressIntervalMs && (total <= 0 || downloaded < total)) return@ProgressSink
                     lastUpdate = now
                     val speed = meter.sample(downloaded, now)
                     withContext(serial) {
@@ -313,12 +462,19 @@ class KDownloader(
                         }
                     }
                 }
+                if (task.parts.isEmpty()) runner.run(task, options, progress) else runParts(task.id, options, refreshFirst, progress)
                 val finished = find(task.id) ?: task
                 val published = storage.publish(finished, cfg.appFolder, cfg.conflict)
-                storage.deleteParts(task.id)
+                deleteAllParts(finished)
                 withContext(serial) {
                     finish(task.id, skipped = published.skipped) {
-                        copy(status = DownloadStatus.COMPLETED, localUri = published.uri, downloadedBytes = totalBytes.coerceAtLeast(downloadedBytes), speedBytesPerSec = 0)
+                        copy(
+                            status = DownloadStatus.COMPLETED,
+                            localUri = published.uri,
+                            downloadedBytes = totalBytes.coerceAtLeast(downloadedBytes),
+                            speedBytesPerSec = 0,
+                            finishedAt = clock(),
+                        )
                     }
                 }
             } catch (cancelled: CancellationException) {
@@ -327,6 +483,63 @@ class KDownloader(
                 withContext(serial) { fail(task.id, error) }
             }
         }
+    }
+
+    /** Downloads every part of a multi-part task, then merges them into part 0 of the task. */
+    private suspend fun runParts(id: String, options: RunOptions, refreshFirst: Boolean, progress: ProgressSink) {
+        val handle = object : TaskHandle {
+            override fun current(): DownloadTask = find(id) ?: throw CancellationException("Task removed")
+
+            override suspend fun update(transform: (DownloadTask) -> DownloadTask) = withContext(serial) {
+                if (jobs.containsKey(id)) {
+                    edit(id) { transform(this) }
+                    persist()
+                }
+            }
+
+            override suspend fun refreshUrls(): Boolean = refreshUrls(id)
+
+            override suspend fun progress(downloaded: Long, total: Long) = progress.update(downloaded, total, 1)
+        }
+        if (refreshFirst) {
+            try {
+                handle.refreshUrls()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+            }
+        }
+        val inputs = partRunner.run(handle, options)
+        withContext(serial) {
+            if (jobs.containsKey(id)) {
+                edit(id) { copy(status = DownloadStatus.MERGING, speedBytesPerSec = 0) }
+                persist()
+            }
+        }
+        partRunner.assemble(handle.current(), inputs, merger)
+    }
+
+    /** Puts the [urlRefresher]'s urls into task [id]'s parts; true when any url changed. */
+    private suspend fun refreshUrls(id: String): Boolean {
+        val refresher = urlRefresher ?: return false
+        val task = find(id) ?: return false
+        val fresh = refresher.refresh(task) ?: return false
+        var changed = false
+        withContext(serial) {
+            edit(id) {
+                copy(parts = parts.mapIndexed { index, part ->
+                    val match = if (part.key.isNotEmpty()) fresh.firstOrNull { it.key == part.key } else fresh.getOrNull(index)
+                    if (match == null) {
+                        part
+                    } else {
+                        if (match.url != part.url) changed = true
+                        part.copy(url = match.url, headers = part.headers + match.headers)
+                    }
+                })
+            }
+            persist()
+        }
+        return changed
     }
 
     /** Retries with backoff while the policy allows, otherwise marks the task failed. */
@@ -375,10 +588,11 @@ class KDownloader(
 
     private companion object {
         const val SAVE_INTERVAL_MS = 2_000L
+        val UNSAFE_NAME = Regex("""[\\/:*?"<>|]""")
 
         fun nextOrder(list: List<DownloadTask>): Long = (list.maxOfOrNull { it.order } ?: 0) + 1
 
-        fun DownloadRequest.toTask(id: String, now: Long, order: Long) = DownloadTask(
+        fun DownloadRequest.toTask(id: String, url: String, now: Long, order: Long) = DownloadTask(
             id = id,
             url = url,
             fileName = fileName,
@@ -395,11 +609,12 @@ class KDownloader(
             wifiOnly = wifiOnly,
             speedLimitBytesPerSec = speedLimitBytesPerSec,
             notBefore = notBefore,
+            parts = parts,
         )
 
         /** Downloads cut off by a restart either continue or wait paused. */
         fun restore(saved: List<DownloadTask>, autoResume: Boolean): List<DownloadTask> = saved.map {
-            if (it.status == DownloadStatus.RUNNING) it.copy(status = if (autoResume) DownloadStatus.QUEUED else DownloadStatus.PAUSED) else it
+            if (it.status.isWorking) it.copy(status = if (autoResume) DownloadStatus.QUEUED else DownloadStatus.PAUSED) else it
         }
     }
 }

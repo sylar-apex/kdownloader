@@ -11,6 +11,10 @@ package org.app.kdownloader.model
  * - [notBefore]: epoch millis before which the download does not start.
  * - [extras]: the app's own data, carried untouched.
  * - [totalBytesHint]: size shown until the server reports the real one.
+ * - [parts]: several resources (e.g. separate video and audio streams) downloaded one after the other,
+ *   each to its own file, then joined by the downloader's [org.app.kdownloader.merge.Merger]. When set,
+ *   [url] and [headers] are not downloaded; [url] still identifies the task for duplicate checks and
+ *   defaults to the first part's url when blank.
  */
 data class DownloadRequest(
     val url: String,
@@ -25,4 +29,5 @@ data class DownloadRequest(
     val notBefore: Long = 0,
     val totalBytesHint: Long = 0,
     val extras: Map<String, String> = emptyMap(),
+    val parts: List<DownloadPart> = emptyList(),
 )

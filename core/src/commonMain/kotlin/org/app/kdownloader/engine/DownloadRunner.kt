@@ -13,11 +13,12 @@ internal fun interface ProgressSink {
     suspend fun update(downloaded: Long, total: Long, segments: Int)
 }
 
-/** How one task is fetched: connections wanted, minimum part size and the speed limiters it passes through. */
+/** How one task is fetched: connections wanted, minimum part size, the speed limiters it passes through and the multi-part segment size. */
 internal class RunOptions(
     val connections: Int,
     val minSegmentBytes: Long,
     val limiters: List<RateLimiter>,
+    val segmentBytes: Long = 4L * 1024 * 1024,
 )
 
 /**

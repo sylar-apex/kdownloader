@@ -20,11 +20,20 @@ actual fun defaultNetworkMonitor(): NetworkMonitor = NetworkMonitor { true }
 
 actual fun defaultStorage(): DownloadStorage = DesktopDownloadStorage()
 
-/** Parts in the temp folder; finished files in ~/Movies, ~/Music or ~/Downloads under the app folder. */
+/**
+ * Parts in the temp folder; finished files in ~/Movies, ~/Music or ~/Downloads under the app folder;
+ * hidden files in [privateDir].
+ */
 class DesktopDownloadStorage(
     partsDir: File = File(System.getProperty("java.io.tmpdir"), "kdownloader"),
     private val home: File = File(System.getProperty("user.home")),
-) : FileDownloadStorage(Path(partsDir.path)) {
+    privateDir: File = File(home, ".kdownloader/private"),
+) : FileDownloadStorage(Path(partsDir.path), Path(privateDir.path)) {
+
+    override fun pathOf(uri: String): Path? =
+        if (uri.startsWith("file:")) runCatching { Path(File(java.net.URI(uri)).path) }.getOrNull() else super.pathOf(uri)
+
+    override fun uriOf(path: Path): String = File(path.toString()).toURI().toString()
 
     override suspend fun publish(task: DownloadTask, appFolder: String, conflict: ConflictPolicy): Published {
         val (target, skipped) = resolveTarget(Path(folder(task.destination, appFolder).path), task.fileName, conflict)

@@ -19,7 +19,36 @@ import org.app.kdownloader.model.MediaType
  * Parts live in the app cache. Finished files are published through MediaStore on Android 10+ (no
  * storage permission needed) and copied into the public folders on older versions.
  */
-class AndroidDownloadStorage(private val context: Context) : FileDownloadStorage(Path(File(context.cacheDir, PARTS_DIR).path)) {
+class AndroidDownloadStorage(private val context: Context) : FileDownloadStorage(
+    Path(File(context.cacheDir, PARTS_DIR).path),
+    Path(File(context.filesDir, PRIVATE_DIR).path),
+) {
+
+    override fun pathOf(uri: String): Path? =
+        if (uri.startsWith("content:")) null else Uri.parse(uri).path?.takeIf { uri.startsWith("file:") || uri.startsWith("/") }?.let { Path(it) }
+
+    override fun uriOf(path: Path): String = Uri.fromFile(File(path.toString())).toString()
+
+    override suspend fun copyFromUri(uri: String, target: Path) {
+        if (!uri.startsWith("content:")) return super.copyFromUri(uri, target)
+        val input = context.contentResolver.openInputStream(Uri.parse(uri)) ?: error("Cannot open $uri")
+        input.use { i -> File(target.toString()).outputStream().use { i.copyTo(it) } }
+    }
+
+    override suspend fun deleteUri(uri: String): Boolean {
+        if (!uri.startsWith("content:")) return super.deleteUri(uri)
+        return context.contentResolver.delete(Uri.parse(uri), null, null) > 0
+    }
+
+    override suspend fun renameFile(uri: String, newFileName: String): String? {
+        if (!uri.startsWith("content:")) return super.renameFile(uri, newFileName)
+        return withContext(ioDispatcher) {
+            runCatching {
+                context.contentResolver.update(Uri.parse(uri), ContentValues().apply { put(MediaStore.MediaColumns.DISPLAY_NAME, newFileName) }, null, null)
+                uri
+            }.getOrNull()
+        }
+    }
 
     override suspend fun publish(task: DownloadTask, appFolder: String, conflict: ConflictPolicy): Published = withContext(ioDispatcher) {
         val part = File(partPath(task.id, 0).toString())
@@ -96,5 +125,6 @@ class AndroidDownloadStorage(private val context: Context) : FileDownloadStorage
 
     private companion object {
         const val PARTS_DIR = "kdownloader"
+        const val PRIVATE_DIR = "kdownloader_private"
     }
 }

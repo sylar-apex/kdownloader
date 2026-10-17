@@ -30,6 +30,31 @@ interface DownloadStorage {
 
     /** The folder a [destination] resolves to, for display; empty where there is none. */
     fun locationOf(destination: Destination, appFolder: String): String
+
+    /** The local file of a part, or null where storage has no files. Its folder exists. */
+    fun localPartPath(taskId: String, part: Int): String? = null
+
+    /** Appends part [fromPart] of [fromTaskId] onto part [toPart] of [toTaskId] (creating it) and deletes the source. */
+    suspend fun appendPart(fromTaskId: String, fromPart: Int, toTaskId: String, toPart: Int): Unit =
+        throw UnsupportedOperationException("This storage cannot join parts")
+
+    /** Copies a saved file ([uri]) into part [part] of [taskId]; false when unsupported. */
+    suspend fun importPart(uri: String, taskId: String, part: Int): Boolean = false
+
+    /** Deletes a saved file; false when it could not. */
+    suspend fun deleteFile(uri: String): Boolean = false
+
+    /** Renames a saved file; returns its new uri, or null when unsupported or it failed. */
+    suspend fun renameFile(uri: String, newFileName: String): String? = null
+
+    /**
+     * Moves a finished file into app-private storage (galleries cannot see it) and returns its new uri.
+     * Default: the file stays where it is (only the task's flag changes).
+     */
+    suspend fun hide(task: DownloadTask): String? = task.localUri
+
+    /** Moves a hidden file back to its public location (applying [conflict]) and returns its new uri. */
+    suspend fun unhide(task: DownloadTask, appFolder: String, conflict: ConflictPolicy): String? = task.localUri
 }
 
 /** The storage used by [org.app.kdownloader.KDownloader] when none is given. */

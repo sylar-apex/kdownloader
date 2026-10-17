@@ -35,6 +35,16 @@ downloader.tasks.collect { tasks -> render(tasks) }
 - Custom headers per request (cookies, referer, auth, user agent)
 - Bring your own Ktor `HttpClient` (proxy, logging, certificates)
 
+**Multi-part & media**
+- Multi-part tasks (`DownloadRequest.parts`): e.g. separate video and audio streams, each downloaded to its own file in fixed segments (`segmentBytes`, up to 8 workers) and resumed segment by segment
+- HLS parts (`hls = true`): master playlist → highest-bandwidth variant plus its audio rendition, segments resumed one by one (AES-128 encrypted playlists are not supported)
+- Pluggable `Merger` produces the final file while the task is `MERGING`: MediaMuxer on Android (mux video + audio, remux HLS to MP4); `FallbackMerger` elsewhere (keeps the first stream, or concatenates)
+- `UrlRefresher`: fresh signed urls when a part answers 403/410 and when the user resumes a task
+- 403/429/5xx retried with backoff, without replaying cookies; short reads re-requested from where they stopped
+- `rename`, `setHidden` (private folder), `delete(withFile)`, `convertToMusic` (Android: audio track to M4A without re-encoding), `update` / `putExtras`
+- Media metadata in `extras` with `TaskExtras` keys (title, ext, kind, quality, thumbnail, duration, pageUrl, videoId, subtitleUrl); `hidden`, `finishedAt` and live speed on every task
+- Android foreground service with ongoing progress and completion notifications (`KDownloaderAndroid.enableForegroundService`)
+
 **Saving**
 - Android: MediaStore (Movies, Music or Download / your app folder) — no storage permission on Android 10+
 - Desktop: `~/Movies`, `~/Music` or `~/Downloads` / your app folder
@@ -43,6 +53,8 @@ downloader.tasks.collect { tasks -> render(tasks) }
 - Name conflicts: rename to `name (2).ext`, overwrite, or skip
 
 **Events** — `Started`, `Completed`, `Failed`, `Retrying`, `Skipped`, `WaitingForWifi`
+
+**Statuses** — `QUEUED`, `RUNNING`, `MERGING`, `PAUSED`, `COMPLETED`, `FAILED`, `CANCELED`
 
 ## Modules
 
@@ -66,7 +78,7 @@ commonMain.dependencies { implementation(projects.kdownloader.core) }
 
 The module reads versions from the host project's `libs.versions.toml`: `ktor-client-core`, `ktor-client-cio`,
 `ktor-client-darwin`, `ktor-client-js`, `kotlinx-io-core`, `kotlinx-coroutines-core`, `kotlinx-browser`,
-`kotlin-serialization`.
+`kotlin-serialization`, and `androidx-core-ktx` (Android notifications).
 
 On Android, initialise once in your `Application`:
 
@@ -111,14 +123,76 @@ downloader.events.collect { event ->
 }
 ```
 
+### Multi-part downloads
+
+```kotlin
+val downloader = KDownloader(
+    config = DownloaderConfig(connections = 4, appFolder = "MyApp"),
+    urlRefresher = { task -> api.freshStreams(task.extra(TaskExtras.VIDEO_ID)) }, // List<DownloadPart>? matched by key
+    // merger = MyFfmpegMerger(),  // default: MediaMuxer on Android, FallbackMerger elsewhere
+)
+
+downloader.enqueue(
+    DownloadRequest(
+        url = pageUrl,                       // identifies the task; defaults to the first part's url
+        fileName = "clip(720p).mp4",
+        destination = Destination(MediaType.VIDEO),
+        parts = listOf(
+            DownloadPart(videoUrl, size = videoSize, key = "136", headers = mapOf("User-Agent" to ua)),
+            DownloadPart(audioUrl, size = audioSize, key = "140"),
+        ),
+        extras = mapOf(TaskExtras.TITLE to "clip", TaskExtras.KIND to "Video", TaskExtras.QUALITY to "720p"),
+    ),
+)
+
+// HLS
+downloader.enqueue(DownloadRequest("", "live.mp4", Destination(MediaType.VIDEO), parts = listOf(DownloadPart(m3u8Url, hls = true))))
+
+// Saved pages: an HTML answer is the content, not an error
+DownloadPart(pageUrl, allowHtml = true)
+```
+
+A custom merger writes `job.outputPath` from `job.inputs[i].path`, or calls `job.keepFirst()` / `job.concatenate()`:
+
+```kotlin
+val merger = Merger { job -> ffmpeg("-i", job.inputs[0].path!!, "-i", job.inputs[1].path!!, "-c", "copy", job.outputPath!!) }
+```
+
+### Managing finished files
+
+```kotlin
+downloader.rename(id, "new title")          // file name = new title + old extension; file renamed too
+downloader.setHidden(id, true)              // move to app-private storage (and back with false)
+downloader.delete(id, withFile = true)
+val music: DownloadTask? = downloader.convertToMusic(id)   // Android; null where unsupported
+downloader.putExtras(id, mapOf(TaskExtras.THUMBNAIL to thumbUri))
+```
+
+### Android foreground service
+
+```kotlin
+KDownloaderAndroid.init(this)
+KDownloaderAndroid.enableForegroundService(
+    downloader,
+    NotificationConfig(
+        title = { n -> if (n > 0) getString(R.string.downloading_n, n) else getString(R.string.preparing) },
+        completeTitle = getString(R.string.download_complete),
+        contentIntent = { ctx -> PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE) },
+    ),
+)
+```
+
+The library's manifest declares the `dataSync` service and the `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC` and
+`POST_NOTIFICATIONS` permissions; on Android 13+ the app requests notification permission itself.
+
 ## Platform status
 
-| Platform | Engine | Storage | Wi-Fi detection |
-|---|---|---|---|
-| Android | Ktor CIO | MediaStore | ✅ |
-| Desktop | Ktor CIO | user folders | always unmetered |
-| iOS | Ktor Darwin | Documents | always unmetered |
-| Web (Wasm) | Ktor JS | browser download (partials kept in memory) | always unmetered |
+| Platform | Engine | Storage | Wi-Fi detection | Merger | convertToMusic | setHidden |
+|---|---|---|---|---|---|---|
+| Android | Ktor CIO | MediaStore | ✅ | MediaMuxer | ✅ | app files dir |
+| Desktop | Ktor CIO | user folders | always unmetered | keep first stream | — | `~/.kdownloader/private` |
+| iOS | Ktor Darwin | Documents | always unmetered | keep first stream | — | Application Support |
+| Web (Wasm) | Ktor JS | browser download (partials kept in memory) | always unmetered | keep first stream | — | flag only |
 
 ## Used by
 
