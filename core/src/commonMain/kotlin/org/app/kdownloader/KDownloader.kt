@@ -70,6 +70,14 @@ import kotlin.time.ExperimentalTime
  * joined by [merger] while the task is [DownloadStatus.MERGING]. [urlRefresher] supplies fresh urls when
  * signed links expire. [audioExtractor] powers [convertToMusic] (Android only by default).
  */
+/** Supplies parts (and final name / size) for a task queued without them; null when nothing can be downloaded. */
+fun interface TaskPreparer {
+    suspend fun prepare(task: DownloadTask): DownloadTask?
+}
+
+/** Extra marking a task whose parts [KDownloader.preparer] fills in when it starts. */
+const val PREPARE = "kd.prepare"
+
 @OptIn(ExperimentalTime::class)
 class KDownloader(
     config: DownloaderConfig = DownloaderConfig(),
@@ -81,6 +89,8 @@ class KDownloader(
     private val merger: Merger = defaultMerger(),
     /** Asked for fresh urls of multi-part tasks; may be set after construction. */
     var urlRefresher: UrlRefresher? = null,
+    /** Fills in a task queued without parts (marked [PREPARE]) when it starts, e.g. by resolving its formats then. */
+    var preparer: TaskPreparer? = null,
     private val audioExtractor: AudioExtractor? = defaultAudioExtractor(),
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -462,7 +472,13 @@ class KDownloader(
                         }
                     }
                 }
-                if (task.parts.isEmpty()) runner.run(task, options, progress) else runParts(task.id, options, refreshFirst, progress)
+                // Queued without parts (batch downloads): resolve what to fetch only now, when its turn comes.
+                val ready = if (task.parts.isEmpty() && task.extras[PREPARE] == "1") {
+                    val prepared = preparer?.prepare(task) ?: error("No downloadable format")
+                    withContext(serial) { edit(task.id) { prepared.copy(id = id, status = status, extras = prepared.extras - PREPARE) } }
+                    find(task.id) ?: task
+                } else task
+                if (ready.parts.isEmpty()) runner.run(ready, options, progress) else runParts(task.id, options, refreshFirst, progress)
                 val finished = find(task.id) ?: task
                 val published = storage.publish(finished, cfg.appFolder, cfg.conflict)
                 deleteAllParts(finished)
